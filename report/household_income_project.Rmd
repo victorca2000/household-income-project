@@ -1,0 +1,517 @@
+---
+title: "Household-Income-Project"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Imports all libraries necessary throughout the project
+library(tidyverse)     # tidyverse
+library(cowplot) # To place different plots in a grid
+library(fastDummies) # For one-hot encoding purposes
+library(caret) # For one-hot encoding purposes
+library(corrplot) # To create plots of correlations matrices
+library(dplyr) # For data cleaning
+library(kableExtra) # To print out kables
+library(glmnetUtils) # To use cv.glmnet() and cva.glmnet() functions
+library(rpart)         # to train decision trees
+library(rpart.plot)    # to plot decision trees
+library(randomForest)  # random forests
+library(gbm)           # boosting
+
+source("../code/functions/plot_glmnet.R") # Retrieves plot_glmnet() function 
+``` 
+
+```{r}
+raw_data <- read.csv('../data/raw/hhpub18.csv') # Loads household dataset
+print(raw_data) # Prints dataset
+```
+```{r}
+n = nrow(raw_data) # Computes the number of rows in the raw data
+print(n)
+print(ncol(raw_data)) # Computes the number of columns in the raw data
+```
+
+```{r}
+summary(raw_data$HTOTVAL) # Calculates the summary statistics for the response variable
+```
+
+```{r}
+# Filters the data to only include households that were interviewed
+data_filtered <- raw_data %>%
+  filter(H_HHTYPE == 1)
+```
+
+```{r}
+# Calculates the percentage of rows lost if removing households with a zero income
+data_filtered %>% filter(HTOTVAL == 0) %>% nrow()/n
+
+# Removes those households given that the percentage is low
+data_filtered <- data_filtered %>% filter(HTOTVAL != 0)
+```
+
+```{r}
+# remove allocation flags
+data_filtered <- data_filtered %>% select(-matches("^(H1|I_)"))
+```
+
+```{r}
+# Demonstrates a linear combination of features and sees the correlation of the sum of features with total household income
+data_filtered %>%
+  mutate(OTINC = HANNVAL + HCSPVAL + HDISVAL + HDIVVAL + HDSTVAL +
+           HEDVAL + HFINVAL + HINTVAL + HPAWVAL + HPENVAL + HRNTVAL + HSSIVAL + 
+           HSSVAL + HSURVAL + HUCVAL + HVETVAL + HWCVAL + HOIVAL) %>%
+  select(OTINC,HOTHVAL) %>%
+  as.matrix %>% 
+  cor
+```
+
+```{r}
+# Removes features that are addends of HTOTVAL
+data_filtered <- data_filtered %>%
+  select(-HANNVAL,-HCSPVAL,-HDISVAL,-HDIVVAL,-HDSTVAL,-HEDVAL,-HFINVAL,-HINTVAL,
+         -HPAWVAL,-HPENVAL,-HRNTVAL,-HSSIVAL,-HSSVAL,-HSURVAL,-HUCVAL,-HVETVAL,
+         -HWCVAL,-HOIVAL,-HOTHVAL,-HEARNVAL) 
+
+# Removes features that have the same value for each observation
+data_filtered <- data_filtered %>% select(where(~n_distinct(.) > 1))
+```
+
+```{r}
+# Removes features that are not useful, including identifiers or are expressed multiple times
+data_filtered <- data_filtered %>% select(-H_IDNUM, -HEFAMINC, -H_HHNUM, -H_TELAVL, -H_TELINT, -H_MIS, -GESTCEN, -HPCTCUT, -HSUP_WGT, -H_SEQ, -H_RESPNM, -matches("^GTC"), -HHINC, -HH_HI_UNIV, -HTOP5PCT, -GTINDVPC, -GESTFIPS, -GEREG)
+
+# Gets names of columns that are categorical
+categorical_cols <- data_filtered %>% select(-matches("NUM|NO$|VAL$|HFOODMO|UNDER|18|^HUNITS")) %>% colnames
+
+# One-hot encodes the categorical variables
+clean_data <- data_filtered %>% dummy_cols(select_columns = categorical_cols, remove_selected_columns = TRUE) 
+```
+
+```{r}
+# Calculates correlation between features to conduct correlation-based feature selection
+features <- clean_data %>% select(-HTOTVAL)
+corr_features = cor(features)
+
+# Plots the correlation matrix to check if there are dark spots to remove
+corrplot(corr_features, type = "upper", order = "hclust", tl.col = "black", tl.srt = 45, tl.cex = 0.2)
+
+# Removes one of the two features when their correlation is above 0.7
+hc = findCorrelation(corr_features, cutoff = 0.7)
+hc = sort(hc)
+features <- features[, -c(hc)]
+```
+
+```{r}
+# Finalizes data cleaning and initial feature selection
+data <- features
+data$HTOTVAL <- clean_data[["HTOTVAL"]]
+
+# Plots the distribution of total household income
+p1 <- data %>% ggplot() + geom_histogram(aes(x = HTOTVAL), binwidth = 50, color = "blue", fill = "dodgerblue") +
+  labs(x = "HTOTVAL", y = "Frequency", title = "Distribution of HTOTVAL")
+
+# Plots the distribution of the log of total household income
+p2 <- data %>% ggplot() + geom_histogram(aes(x = log(HTOTVAL)), binwidth = 0.25, color = "blue", fill = "dodgerblue") +
+  labs(x = "Log of HTOTVAL", y = "Frequency", title = "Distribution of Log Transform")
+
+# Creates side-by-side plots
+plot_grid(p1, p2)
+```
+
+```{r}
+# Since the distribution after the transformation is more normal, let's transform the data and remove null or -inf values
+data <- data %>% mutate(HTOTVAL = log(HTOTVAL)) %>% drop_na() %>% filter(HTOTVAL != -Inf)
+
+# Prints final clean data for modeling
+print(data)
+```
+
+```{r}
+write.csv(data,"../data/clean/hhpub18_clean.csv", row.names = FALSE)
+```
+
+```{r}
+# Creates side-by-side boxplots of the distribution of income divided by households in a metropolitan versus in a non-metropolitan area
+data %>% ggplot(aes(x = as.factor(GTMETSTA_2), y = HTOTVAL, fill = as.factor(GTMETSTA_2))) + geom_boxplot(outlier.colour = "black", outlier.shape = 8, outlier.size = 1) + theme(legend.position = "none") + labs(x = "Metropolitan Status", y = "Total Household Income", title = "Distribution of Household Income by Metropolitan Status") + scale_fill_brewer(palette="BuPu") + scale_x_discrete(labels=c("Metropolitan", "Not metropolitan"))
+```
+
+```{r}
+# Imports library to randomize color selection
+library(randomcoloR)
+
+# Creates a list of random color values
+r_colors <- randomColor(9)
+
+# Graphs relationship between property value and income for New England households
+p1 <- data %>% filter(GEDIV_1 == 1) %>% ggplot(aes(x = log(HPROP_VAL), y = HTOTVAL)) + geom_point(color = r_colors[1]) + labs(x = "Property Value", y = "Total Income", title = "New England") + geom_smooth(linetype = "dashed")
+
+# Graphs relationship between property value and income for Middle Atlantic households
+p2 <- data %>% filter(GEDIV_2 == 1) %>% ggplot(aes(x = log(HPROP_VAL), y = HTOTVAL)) + geom_point(color = r_colors[2]) + labs(x = "Property Value", y = "Total Income", title = "Middle Atlantic") + geom_smooth(linetype = "dashed")
+
+# Graphs relationship between property value and income for East North Central households
+p3 <- data %>% filter(GEDIV_3 == 1) %>% ggplot(aes(x = log(HPROP_VAL), y = HTOTVAL)) + geom_point(color = r_colors[3]) + labs(x = "Property Value", y = "Total Income", title = "East North Central") + geom_smooth(linetype = "dashed")
+
+# Graphs relationship between property value and income for West North Central households
+p4 <- data %>% filter(GEDIV_4 == 1) %>% ggplot(aes(x = log(HPROP_VAL), y = HTOTVAL)) + geom_point(color = r_colors[4]) +labs(x = "Property Value", y = "Total Income", title = "West North Central") + geom_smooth(linetype = "dashed")
+
+# Graphs relationship between property value and income for South Atlantic households
+p5 <- data %>% filter(GEDIV_5 == 1) %>% ggplot(aes(x = log(HPROP_VAL), y = HTOTVAL)) + geom_point(color = r_colors[5]) + labs(x = "Property Value", y = "Total Income", title = "South Atlantic") + geom_smooth(linetype = "dashed")
+
+# Graphs relationship between property value and income for East South Central households
+p6 <- data %>% filter(GEDIV_6 == 1) %>% ggplot(aes(x = log(HPROP_VAL), y = HTOTVAL)) + geom_point(color = r_colors[6]) + labs(x = "Property Value", y = "Total Income", title = "East South Central") + geom_smooth(linetype = "dashed")
+
+# Graphs relationship between property value and income for West South Central households
+p7 <- data %>% filter(GEDIV_7 == 1) %>% ggplot(aes(x = log(HPROP_VAL), y = HTOTVAL)) + geom_point(color = r_colors[7]) + labs(x = "Property Value", y = "Total Income", title = "West South Central") + geom_smooth(linetype = "dashed")
+
+# Graphs relationship between property value and income for Mountain region households
+p8 <- data %>% filter(GEDIV_8 == 1) %>% ggplot(aes(x = log(HPROP_VAL), y = HTOTVAL)) + geom_point(color = r_colors[8]) + labs(x = "Property Value", y = "Total Income", title = "Mountain") + geom_smooth(linetype = "dashed")
+
+# Graphs relationship between property value and income for Pacific region households
+p9 <- data %>% filter(GEDIV_9 == 1) %>% ggplot(aes(x = log(HPROP_VAL), y = HTOTVAL)) + geom_point(color = r_colors[9]) + labs(x = "Property Value", y = "Total Income", title = "Pacific") + geom_smooth(linetype = "dashed")
+
+# Places all plots in a grid
+plot_grid(p1, p2, p3, p4, p5, p6, p7, p8, p9, ncol = 3)
+```
+
+```{r}
+# Creates plot comparing the number of households not eligible for Medicaid in households receiving government assistance for rent versus not receiving help
+data %>% ggplot(aes(x = as.factor(HLORENT_1), y = NOW_HMCAID_3)) + geom_col(aes(color = as.factor(HLORENT_1))) + labs(x = "Government Assisting w/ Rent?", y = "Households Not Eligible for Medicaid", title = "Relationship Between Gov. Assistance w/ Rent Versus Health") + scale_x_discrete(labels=c("No", "Yes")) + theme(legend.position = "none") 
+```
+
+```{r}
+set.seed(471) # seed set for reproducibility (DO NOT CHANGE)
+train_samples = sample(1:n, round(0.8*n))
+
+# split data into training and test sets
+train_samples = sample(1:nrow(data), 0.8*nrow(data))
+train_data = data %>% filter(row_number() %in% train_samples)
+test_data = data %>% filter(!(row_number() %in% train_samples))
+```
+
+```{r}
+# Fits an ordinary least squares regression on the train data
+lm_fit <- lm(HTOTVAL ~ .,data = train_data)
+
+# Summarizes the results of the OLS regression
+summary(lm_fit)
+```
+
+```{r}
+# Fits a ridge regression on the train data with a 10-fold cross-validation for the lambda value
+ridge_fit = cv.glmnet(HTOTVAL ~ ., alpha = 0, nfolds = 10,
+data = train_data)
+
+plot(ridge_fit) #plot CV plot
+```
+
+```{r}
+# Calculates the lambda chosen by the one standard error rule
+ridge_fit$lambda.1se
+```
+
+```{r}
+# Creates a coefficient matrix for the regression
+coef(ridge_fit, s = "lambda.1se")
+```
+
+```{r}
+# Extract standard coefficients in ridge fit
+extract_std_coefs(ridge_fit, train_data)
+
+# Exports extracted coefficients table into a csv
+write.csv(extract_std_coefs(ridge_fit, train_data) ,"../results/ridge_coeffs.csv", row.names = FALSE)
+```
+
+```{r}
+# Plots the coefficients for the features depending on the lambda value
+plot_glmnet(ridge_fit, train_data, features_to_plot = 10)
+```
+
+```{r}
+# Fits a lasso regression on the train data with a 10-fold cross-validation for the lambda value
+lasso_fit = cv.glmnet(HTOTVAL ~ ., alpha = 1, nfolds = 10,
+data = train_data)
+
+plot(lasso_fit) #plot CV plot
+```
+
+```{r}
+# Calculates the lambda chosen with the one standard error rule
+lasso_fit$lambda.1se
+```
+
+```{r}
+# Creates a coefficient matrix for the lasso fit, which is sparser than that of ridge
+extract_std_coefs(lasso_fit, train_data)
+
+# Exports extracted coefficients table into a csv
+write.csv(extract_std_coefs(lasso_fit, train_data) ,"../results/lasso_coeffs.csv", row.names = FALSE)
+```
+
+```{r}
+# Only include nonzero coefficients in the matrix
+extract_std_coefs(lasso_fit, train_data) %>% filter(coefficient != 0)
+```
+
+```{r}
+# Plots the coefficients for the features depending on the lambda value
+plot_glmnet(lasso_fit, train_data, features_to_plot = 10)
+```
+
+```{r}
+# Fits an elastic net regression with a 10-fold CV to get the optimal alpha value
+elnet_fit = cva.glmnet(HTOTVAL ~ ., nfolds = 10, data = train_data)
+
+# Plots the minimum CV error versus alpha to get the optimal value indicated by the dashed line
+plot_cva_glmnet(elnet_fit)
+```
+
+```{r}
+# Extracts the best alpha value for the model
+elnet_fit_best = extract_best_elnet(elnet_fit)
+elnet_fit_best$alpha
+```
+
+```{r}
+# Plots the CV plot to get the lambda value
+plot(elnet_fit_best)
+```
+
+```{r}
+# Extracts the lambda chosen by the one standard erro rule
+elnet_fit_best$lambda.1se
+```
+
+```{r}
+# Gets nonzero coefficients in coefficient matrix
+extract_std_coefs(elnet_fit_best, train_data)
+
+write.csv(extract_std_coefs(elnet_fit_best, train_data) ,"../results/elnet_coeffs.csv", row.names = FALSE)
+```
+
+```{r}
+# Plots the coefficients for the features depending on the lambda value
+plot_glmnet(elnet_fit_best, train_data, features_to_plot = 10)
+```
+
+```{r}
+# Predicts the total household income on the test data using the ols model
+ols_predictions = predict(lm_fit, newdata = test_data) %>% as.numeric()
+
+# Predicts the total household income on the test data using the ridge model
+ridge_predictions = predict(ridge_fit, newdata = test_data, s = "lambda.1se") %>% as.numeric()
+
+# Predicts the total household income on the test data using the lasso model
+lasso_predictions = predict(lasso_fit, newdata = test_data, s = "lambda.1se") %>% as.numeric()
+
+# Predicts the total household income on the test data using the elastic net model
+elnet_predictions = predict(elnet_fit, alpha = elnet_fit$alpha, newdata = test_data, s = "lambda.1se") %>% as.numeric()
+```
+
+```{r}
+# Computes the test RMSE for the models
+RMSE_ols = sqrt(mean((ols_predictions - test_data$HTOTVAL)^2))
+RMSE_ridge = sqrt(mean((ridge_predictions - test_data$HTOTVAL)^2))
+RMSE_lasso = sqrt(mean((lasso_predictions - test_data$HTOTVAL)^2))
+RMSE_elnet = sqrt(mean((elnet_predictions - test_data$HTOTVAL)^2))
+
+# Creates tibble to present the test RMSE for each model
+RMSE_table <- tibble("Ols RMSE" = RMSE_ols, "Ridge RMSE" = RMSE_ridge, "Lasso RMSE" = RMSE_lasso, "Elastic Net RMSE" = RMSE_elnet)
+RMSE_table
+
+write.csv(RMSE_table, "../results/regr_RMSE.csv", row.names = FALSE)
+```
+
+```{r}
+# fitting the regression tree
+tree_fit = rpart(HTOTVAL ~. , data = train_data)
+rpart.plot(tree_fit)
+cp_table = printcp(tree_fit) %>% as_tibble()
+write.csv(cp_table, "../results/cp_table.csv", row.names = FALSE)
+
+# CV plot
+cp_table %>%
+  ggplot(aes(x = nsplit+1, y = xerror,
+             ymin = xerror - xstd, ymax = xerror + xstd)) +
+  geom_point() + geom_line() +
+  geom_errorbar(width = 0.2) +
+  xlab("Number of terminal nodes") + ylab("CV error") +
+  geom_hline(aes(yintercept = min(xerror)), linetype = "dashed") +
+  theme_bw()
+```
+
+```{r}
+optimal_tree_info = cp_table %>%
+  filter(xerror - xstd < min(xerror)) %>%
+  arrange(nsplit) %>%
+  head(1)
+
+write.csv(optimal_tree_info, "../results/optimal_tree.csv", row.names = FALSE)
+
+# Prunes tree
+optimal_tree = prune(tree_fit, cp = optimal_tree_info$CP)
+rpart.plot(optimal_tree)
+```
+
+
+```{r}
+# sub-sampling for random Forest
+set.seed(5)
+subsample = sample(1:nrow(train_data), 0.2*nrow(train_data))
+rf_data = train_data %>% filter(row_number() %in% subsample)
+nrow(rf_data)
+
+# Random Forest
+rf_fit = randomForest(HTOTVAL ~., data = rf_data)
+plot(rf_fit)
+```
+
+
+```{r}
+# tuned random forest
+mvalues = seq(1,90, by = 11) 
+oob_errors = numeric(length(mvalues)) 
+ntree = 200
+for(idx in 1:length(mvalues)){
+  m = mvalues[idx]
+  poverty_tune = randomForest(HTOTVAL ~ ., mtry = m, data = rf_data)
+  oob_errors[idx] = poverty_tune$mse[ntree]
+}
+```
+
+```{r}
+# plotting OOB errors versus m
+tibble(m = mvalues, oob_err = oob_errors) %>%
+  ggplot(aes(x = m, y = oob_err)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = mvalues) +
+  labs(
+    x = "Number of Features",
+    y = "Out of Bag Error" ) +
+  theme_bw()
+```
+
+```{r}
+tibble(rf_fit$mse[200],oob_errors[6])
+```
+
+```{r}
+# trained random forest with 500 trees
+set.seed(1) 
+rf_final <- randomForest(HTOTVAL ~ ., ntree = 200,
+                         mtry = 56,
+                         importance = TRUE,
+                         data = rf_data)
+plot(rf_final, main = "")
+```
+
+```{r}
+# variable importance plot
+varImpPlot(rf_final, n.var = 10, main = "Variable Importance Plot")
+```
+
+```{r}
+# Boosting
+set.seed(1) 
+gbm_fit_one = gbm(HTOTVAL ~ .,
+              distribution = "gaussian",
+              n.trees = 3000,
+              interaction.depth = 1,
+              shrinkage = 0.1,
+              cv.folds = 5,
+              data = train_data)
+set.seed(1)
+gbm_fit_two = gbm(HTOTVAL ~ .,
+              distribution = "gaussian",
+              n.trees = 3000,
+              interaction.depth = 2,
+              shrinkage = 0.1,
+              cv.folds = 5,
+              data = train_data)
+set.seed(1)
+gbm_fit_three = gbm(HTOTVAL ~ .,
+              distribution = "gaussian",
+              n.trees = 3000,
+              interaction.depth = 3,
+              shrinkage = 0.1,
+              cv.folds = 5,
+              data = train_data)
+```
+
+```{r}
+# extract CV erorrs
+ntrees = 3000
+boost_cv_errors = bind_rows(
+  tibble(ntree = 1:ntrees, cv_err = gbm_fit_one$cv.error, depth = 1),
+  tibble(ntree = 1:ntrees, cv_err = gbm_fit_two$cv.error, depth = 2),
+  tibble(ntree = 1:ntrees, cv_err = gbm_fit_three$cv.error, depth = 3)
+)
+```
+
+```{r}
+# plot CV errors
+boost_cv_errors %>%
+  ggplot(aes(x = ntree, y = cv_err, colour = factor(depth))) +
+  geom_line() +
+  geom_hline(aes(yintercept = min(gbm_fit_one$cv.error)), 
+             linetype = "dashed", color = "red") +
+  geom_hline(aes(yintercept = min(gbm_fit_two$cv.error)), 
+             linetype = "dashed", color = "green") +
+  geom_hline(aes(yintercept = min(gbm_fit_three$cv.error)), 
+             linetype = "dashed", color = "blue") +
+  labs( 
+    x = "Number of Trees",
+    y = "CV Error"
+    ) +
+  theme_bw()
+```
+
+```{r}
+gbm_fit_optimal = gbm_fit_three
+optimal_num_trees = gbm.perf(gbm_fit_three, plot.it = FALSE)
+optimal_num_trees
+```
+
+```{r}
+# relative influence table
+rel_inf_table <- summary(gbm_fit_optimal,
+                         n.trees = optimal_num_trees,
+                         plotit = FALSE) %>%
+  slice(1:10) %>%
+  remove_rownames()
+
+rel_inf_table
+```
+
+```{r}
+# partial dependence plots
+p1 <- plot(gbm_fit_optimal, 
+           i.var = "HWSVAL", 
+           n.trees = optimal_num_trees)
+p2 <- plot(gbm_fit_optimal, 
+           i.var = "HSS_YN_2", 
+           n.trees = optimal_num_trees)
+p3 <- plot(gbm_fit_optimal, 
+           i.var = "HSEVAL", 
+           n.trees = optimal_num_trees)
+plot_grid(p1,p2,p3)
+```
+
+```{r}
+# test set evaluation 
+pred = predict(optimal_tree, newdata = test_data)
+RMSE_tree <- sqrt(mean((pred - test_data$HTOTVAL) ^ 2))
+                  
+rf_predictions = predict(rf_final, newdata = test_data)
+RMSE_rf <- sqrt(mean((rf_predictions - test_data$HTOTVAL) ^ 2))
+
+gbm_predictions = predict(gbm_fit_optimal, n.trees = optimal_num_trees,
+                          newdata = test_data)
+RMSE_gbm <- sqrt(mean((gbm_predictions - test_data$HTOTVAL) ^ 2))
+
+tibble(RMSE_tree,RMSE_rf,RMSE_gbm)
+```
